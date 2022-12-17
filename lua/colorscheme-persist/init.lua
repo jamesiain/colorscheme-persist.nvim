@@ -1,9 +1,11 @@
 local pickers = require("telescope.pickers")
+local previewers = require("telescope.previewers")
 local finders = require("telescope.finders")
 local conf = require("telescope.config").values
 local themes = require("telescope.themes")
 local actions = require("telescope.actions")
 local action_state = require("telescope.actions.state")
+local utils = require("telescope.utils")
 
 -- main table with default options
 local M = {
@@ -32,7 +34,8 @@ local M = {
     "zellner"
   },
   -- Options for the telescope picker
-  picker_opts = themes.get_dropdown()
+  picker_opts = themes.get_dropdown(),
+  enable_preview = false,
 }
 
 -- Get list with all colorschemes without disabled ones
@@ -92,6 +95,7 @@ end
 -- Open telescope picker to change and save colorscheme
 function M.picker()
   local before_color = M.get_colorscheme()
+  local need_restore = true
   local colors = M.colorschemes or { before_color }
 
   if not vim.tbl_contains(colors, before_color) then
@@ -105,10 +109,56 @@ function M.picker()
     end, colors)
   )
 
-  pickers.new(M.picker_opts, {
+  local previewer
+
+  if M.enable_preview then
+    local bufnr = vim.api.nvim_get_current_buf()
+    local name = vim.api.nvim_buf_get_name(bufnr)
+
+    if not vim.fn.buflisted(bufnr) then
+      -- don't need previewer for empty buffers
+      local deleted = false
+      local del_win = function(win_id)
+        if win_id and vim.api.nvim_win_is_valid(win_id) then
+          utils.buf_delete(vim.api.nvim_win_get_buf(win_id))
+          pcall(vim.api.nvim_win_close, win_id, true)
+        end
+      end
+
+      previewer = previewers.new {
+        preview_fn = function(_, entry, status)
+          if not deleted then
+            deleted = true
+            del_win(status.preview_win)
+            del_win(status.preview_border_win)
+          end
+          vim.cmd("colorscheme" .. entry.value)
+        end,
+      }
+    else
+      -- show current buffer content in previewer
+      previewer = previewers.new_buffer_previewer {
+        get_buffer_by_name = function()
+          return name
+        end,
+        define_preview = function(self, entry)
+          if vim.loop.fs_stat(name) then
+            conf.buffer_previewer_maker(name, self.state.bufnr, { bufname = self.state.bufname })
+          else
+            local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+            vim.api.nvim_buf_set_lines(self.state.bufnr, 0, -1, false, lines)
+          end
+          vim.cmd("colorscheme " .. entry.value)
+        end,
+      }
+    end
+  end
+
+  local picker = pickers.new(M.picker_opts, {
     prompt_title = "colorschemes",
     finder = finders.new_table({ results = colors }),
     sorter = conf.generic_sorter(M.picker_opts),
+    previewer = previewer,
     attach_mappings = function(prompt_bufnr)
       actions.select_default:replace(function()
         actions.close(prompt_bufnr)
@@ -121,6 +171,7 @@ function M.picker()
         else
           colorscheme = selection[1]
         end
+        need_restore = false
         vim.cmd("colorscheme default") -- reset settings
         vim.cmd("colorscheme " .. colorscheme) -- change colorscheme
         -- save
@@ -128,7 +179,21 @@ function M.picker()
       end)
       return true
     end,
-  }):find()
+  })
+
+  if M.enable_preview then
+    local old_close_windows = picker.close_windows
+
+    -- restore original colorscheme, if needed
+    picker.close_windows = function(status)
+      old_close_windows(status)
+      if need_restore then
+        vim.cmd("colorscheme " .. before_color)
+      end
+    end
+  end
+
+  picker:find()
 end
 
 return M
